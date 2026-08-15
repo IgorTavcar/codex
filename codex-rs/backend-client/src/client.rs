@@ -35,6 +35,10 @@ use serde::de::DeserializeOwned;
 use std::fmt;
 
 mod rate_limit_resets;
+mod thread_usage;
+
+pub use thread_usage::ThreadUsage;
+pub use thread_usage::ThreadUsageBreakdownGroup;
 
 #[derive(Debug)]
 pub enum RequestError {
@@ -693,6 +697,9 @@ impl Client {
             }
             crate::types::PlanType::Business => AccountPlanType::Business,
             crate::types::PlanType::Ent26 => AccountPlanType::Ent26,
+            crate::types::PlanType::EnterpriseCbpAutomation => {
+                AccountPlanType::EnterpriseCbpAutomation
+            }
             crate::types::PlanType::EnterpriseCbpUsageBased => {
                 AccountPlanType::EnterpriseCbpUsageBased
             }
@@ -750,6 +757,10 @@ mod tests {
         assert_eq!(
             Client::map_plan_type(crate::types::PlanType::EnterpriseCbpUsageBased),
             AccountPlanType::EnterpriseCbpUsageBased
+        );
+        assert_eq!(
+            Client::map_plan_type(crate::types::PlanType::EnterpriseCbpAutomation),
+            AccountPlanType::EnterpriseCbpAutomation
         );
         let ent26 = serde_json::from_str::<crate::types::PlanType>("\"ent26\"")
             .expect("ent26 backend plan should deserialize");
