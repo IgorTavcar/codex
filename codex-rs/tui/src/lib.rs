@@ -170,7 +170,6 @@ mod session_archive_commands;
 mod session_log;
 mod session_resume;
 mod session_state;
-mod shimmer;
 mod skills_helpers;
 mod slash_command;
 mod startup_draft;
@@ -732,6 +731,7 @@ fn latest_session_lookup_params(
         source_kinds: Some(resume_source_kinds(include_non_interactive)),
         archived: Some(false),
         section_id: None,
+        project_id: None,
         parent_thread_id: None,
         ancestor_thread_id: None,
         cwd: cwd_filter.map(|cwd| ThreadListCwdFilter::One(cwd.to_string_lossy().to_string())),
@@ -1412,6 +1412,11 @@ async fn run_ratatui_app(
     } else {
         resume_picker::SessionSelection::StartFresh
     };
+
+    if let Err(err) = startup_draft.update_session_selection(&mut tui, &session_selection) {
+        shutdown_startup_session(app_server.take(), &mut terminal_restore_guard).await;
+        return Err(err.into());
+    }
 
     if matches!(
         &session_selection,
