@@ -189,6 +189,9 @@ pub(crate) fn apply_network_proxy_feature_config(
         mitm: None,
     }
     .apply_to_network_proxy_config(config);
+    if let Some(credential_broker) = feature_config.credential_broker {
+        config.set_credential_broker_enabled(credential_broker);
+    }
 }
 
 pub(crate) fn resolve_permission_profile(
@@ -243,7 +246,7 @@ fn insert_filesystem_permission_toml(
     match entry.path {
         FileSystemPath::Path { path } => {
             entries.insert(
-                path.into_path_buf().to_string_lossy().into_owned(),
+                path.inferred_native_path_string(),
                 FilesystemPermissionToml::Access(entry.access),
             );
         }

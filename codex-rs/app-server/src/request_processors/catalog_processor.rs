@@ -57,6 +57,7 @@ fn skills_to_info(
                 path: skill.path_to_skills_md.clone(),
                 scope: skill.scope.into(),
                 enabled,
+                plugin_id: skill.plugin_id.clone(),
             }
         })
         .collect()
@@ -608,7 +609,8 @@ impl CatalogRequestProcessor {
                     continue;
                 }
             };
-            let plugin_hooks = if config.features.enabled(Feature::Plugins) {
+            let hooks_enabled = config.features.enabled(Feature::CodexHooks);
+            let plugin_hooks = if hooks_enabled && config.features.enabled(Feature::Plugins) {
                 let plugins_input = config.plugins_config_input();
                 let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
                 codex_core_plugins::PluginHookLoadOutcome {
@@ -619,7 +621,7 @@ impl CatalogRequestProcessor {
                 codex_core_plugins::PluginHookLoadOutcome::default()
             };
             let hooks = codex_hooks::list_hooks(codex_hooks::HooksConfig {
-                feature_enabled: config.features.enabled(Feature::CodexHooks),
+                feature_enabled: hooks_enabled,
                 bypass_hook_trust: config.bypass_hook_trust,
                 config_layer_stack: Some(config.config_layer_stack),
                 plugin_hook_sources: plugin_hooks.hook_sources,
