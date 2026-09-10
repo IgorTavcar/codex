@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::path::Path;
 
 use codex_analytics::GuardianReviewedAction;
@@ -6,12 +7,15 @@ use codex_protocol::approvals::GuardianCommandSource;
 use codex_protocol::approvals::NetworkApprovalProtocol;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::request_permissions::RequestPermissionProfile;
+#[cfg(unix)]
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use codex_utils_path_uri::PathUri;
 use serde::Serialize;
+use serde::ser::Error as _;
 use serde_json::Value;
 
+use super::GUARDIAN_MAX_ACTION_BYTES;
 use super::GUARDIAN_MAX_ACTION_STRING_TOKENS;
 use super::prompt::guardian_truncate_text;
 
@@ -19,27 +23,26 @@ use super::prompt::guardian_truncate_text;
 pub(crate) enum GuardianApprovalRequest {
     ExecCommand {
         id: String,
+        environment_id: String,
         command: Vec<String>,
-        cwd: AbsolutePathBuf,
+        cwd: PathUri,
+        /// Executor-native rendering sent to Guardian; `cwd` remains typed for attribution.
+        guardian_cwd: LegacyAppPathString,
         sandbox_permissions: crate::sandboxing::SandboxPermissions,
         additional_permissions: Option<AdditionalPermissionProfile>,
         justification: Option<String>,
         tty: bool,
     },
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Constructed by the follow-up stdin approval routing change"
-        )
-    )]
     WriteStdin {
         id: String,
         approval_id: String,
+        environment_id: String,
         process_id: i32,
         input: String,
         cwd: PathUri,
         tty: bool,
+        sandbox_permissions: crate::sandboxing::SandboxPermissions,
+        additional_permissions: Option<AdditionalPermissionProfile>,
     },
     #[cfg(unix)]
     Execve {
@@ -52,8 +55,8 @@ pub(crate) enum GuardianApprovalRequest {
     },
     ApplyPatch {
         id: String,
-        cwd: AbsolutePathBuf,
-        files: Vec<AbsolutePathBuf>,
+        cwd: PathUri,
+        files: Vec<PathUri>,
         patch: String,
     },
     NetworkAccess {
@@ -116,7 +119,7 @@ pub(crate) struct GuardianMcpAnnotations {
 struct CommandApprovalAction<'a> {
     tool: &'a str,
     command: &'a [String],
-    cwd: &'a Path,
+    cwd: LegacyAppPathString,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
     #[serde(skip_serializing_if = "Option::is_none")]
     additional_permissions: Option<&'a AdditionalPermissionProfile>,
@@ -127,12 +130,23 @@ struct CommandApprovalAction<'a> {
 }
 
 #[derive(Serialize)]
+struct ApplyPatchApprovalAction<'a> {
+    tool: &'static str,
+    cwd: LegacyAppPathString,
+    files: Vec<LegacyAppPathString>,
+    patch: &'a str,
+}
+
+#[derive(Serialize)]
 struct WriteStdinApprovalAction<'a> {
     tool: &'static str,
+    environment_id: &'a str,
     session_id: i32,
     chars: &'a str,
     cwd: LegacyAppPathString,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    additional_permissions: Option<&'a AdditionalPermissionProfile>,
     tty: bool,
 }
 
@@ -198,7 +212,7 @@ fn serialize_guardian_action(value: impl Serialize) -> serde_json::Result<Value>
 fn serialize_command_guardian_action(
     tool: &'static str,
     command: &[String],
-    cwd: &Path,
+    cwd: LegacyAppPathString,
     sandbox_permissions: crate::sandboxing::SandboxPermissions,
     additional_permissions: Option<&AdditionalPermissionProfile>,
     justification: Option<&String>,
@@ -218,7 +232,7 @@ fn serialize_command_guardian_action(
 fn command_assessment_action(
     source: GuardianCommandSource,
     command: &[String],
-    cwd: &AbsolutePathBuf,
+    cwd: &LegacyAppPathString,
 ) -> GuardianAssessmentAction {
     GuardianAssessmentAction::Command {
         source,
@@ -284,8 +298,10 @@ pub(crate) fn guardian_approval_request_to_json(
     match action {
         GuardianApprovalRequest::ExecCommand {
             id: _,
+            environment_id: _,
             command,
-            cwd,
+            cwd: _,
+            guardian_cwd,
             sandbox_permissions,
             additional_permissions,
             justification,
@@ -293,24 +309,29 @@ pub(crate) fn guardian_approval_request_to_json(
         } => serialize_command_guardian_action(
             "exec_command",
             command,
-            cwd,
+            guardian_cwd.clone(),
             *sandbox_permissions,
             additional_permissions.as_ref(),
             justification.as_ref(),
             Some(*tty),
         ),
         GuardianApprovalRequest::WriteStdin {
+            environment_id,
             process_id,
             input,
             cwd,
             tty,
+            sandbox_permissions,
+            additional_permissions,
             ..
         } => serialize_guardian_action(WriteStdinApprovalAction {
             tool: "write_stdin",
+            environment_id,
             session_id: *process_id,
             chars: input,
             cwd: cwd.clone().into(),
-            sandbox_permissions: crate::sandboxing::SandboxPermissions::RequireEscalated,
+            sandbox_permissions: *sandbox_permissions,
+            additional_permissions: additional_permissions.as_ref(),
             tty: *tty,
         }),
         #[cfg(unix)]
@@ -333,12 +354,12 @@ pub(crate) fn guardian_approval_request_to_json(
             cwd,
             files,
             patch,
-        } => Ok(serde_json::json!({
-            "tool": "apply_patch",
-            "cwd": cwd,
-            "files": files,
-            "patch": patch,
-        })),
+        } => serialize_guardian_action(ApplyPatchApprovalAction {
+            tool: "apply_patch",
+            cwd: cwd.clone().into(),
+            files: files.iter().cloned().map(Into::into).collect(),
+            patch,
+        }),
         GuardianApprovalRequest::NetworkAccess {
             id: _,
             turn_id: _,
@@ -404,9 +425,11 @@ pub(crate) fn guardian_assessment_action(
     action: &GuardianApprovalRequest,
 ) -> GuardianAssessmentAction {
     match action {
-        GuardianApprovalRequest::ExecCommand { command, cwd, .. } => {
-            command_assessment_action(GuardianCommandSource::UnifiedExec, command, cwd)
-        }
+        GuardianApprovalRequest::ExecCommand {
+            command,
+            guardian_cwd,
+            ..
+        } => command_assessment_action(GuardianCommandSource::UnifiedExec, command, guardian_cwd),
         GuardianApprovalRequest::WriteStdin {
             approval_id,
             process_id,
@@ -434,8 +457,8 @@ pub(crate) fn guardian_assessment_action(
         },
         GuardianApprovalRequest::ApplyPatch { cwd, files, .. } => {
             GuardianAssessmentAction::ApplyPatch {
-                cwd: cwd.clone(),
-                files: files.clone(),
+                cwd: cwd.clone().into(),
+                files: files.iter().cloned().map(Into::into).collect(),
             }
         }
         GuardianApprovalRequest::NetworkAccess {
@@ -488,7 +511,7 @@ pub(crate) fn guardian_reviewed_action(
             ..
         } => GuardianReviewedAction::UnifiedExec {
             sandbox_permissions: *sandbox_permissions,
-            additional_permissions: additional_permissions.clone(),
+            additional_permissions: additional_permissions.as_ref().map(Into::into),
             tty: *tty,
         },
         GuardianApprovalRequest::WriteStdin { tty, .. } => {
@@ -497,13 +520,11 @@ pub(crate) fn guardian_reviewed_action(
         #[cfg(unix)]
         GuardianApprovalRequest::Execve {
             source,
-            program,
             additional_permissions,
             ..
         } => GuardianReviewedAction::Execve {
             source: *source,
-            program: program.clone(),
-            additional_permissions: additional_permissions.clone(),
+            additional_permissions: additional_permissions.as_ref().map(Into::into),
         },
         GuardianApprovalRequest::ApplyPatch { .. } => GuardianReviewedAction::ApplyPatch {},
         GuardianApprovalRequest::NetworkAccess { protocol, port, .. } => {
@@ -564,10 +585,36 @@ pub(crate) fn guardian_request_turn_id<'a>(
 pub(crate) fn format_guardian_action_pretty(
     action: &GuardianApprovalRequest,
 ) -> serde_json::Result<FormattedGuardianAction> {
-    let value = guardian_approval_request_to_json(action)?;
+    let value = guardian_action_for_review(action)?;
     let (value, truncated) = truncate_guardian_action_value(value);
-    Ok(FormattedGuardianAction {
-        text: serde_json::to_string_pretty(&value)?,
-        truncated,
-    })
+    let text = enforce_guardian_action_byte_limit(serde_json::to_string_pretty(&value)?)?;
+    Ok(FormattedGuardianAction { text, truncated })
+}
+
+fn enforce_guardian_action_byte_limit(text: String) -> serde_json::Result<String> {
+    if text.len() > GUARDIAN_MAX_ACTION_BYTES {
+        return Err(serde_json::Error::custom(format!(
+            "Guardian action exceeds the {GUARDIAN_MAX_ACTION_BYTES}-byte review limit"
+        )));
+    }
+    Ok(text)
+}
+
+pub(crate) fn format_guardian_action_compact(
+    action: &GuardianApprovalRequest,
+) -> serde_json::Result<String> {
+    enforce_guardian_action_byte_limit(serde_json::to_string(&guardian_action_for_review(action)?)?)
+}
+
+fn guardian_action_for_review(action: &GuardianApprovalRequest) -> serde_json::Result<Value> {
+    let mut value = guardian_approval_request_to_json(action)?;
+    if matches!(action, GuardianApprovalRequest::McpToolCall { .. })
+        && let Some(fields) = value.as_object_mut()
+    {
+        // Only host-provided metadata is optional. A nested argument named
+        // "description" is still part of the exact action under review.
+        fields.remove("tool_description");
+        fields.remove("connector_description");
+    }
+    Ok(value)
 }
