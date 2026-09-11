@@ -7,42 +7,91 @@ use codex_code_mode::CodeModeNestedToolCall;
 use codex_code_mode::CodeModeSessionDelegate;
 use codex_code_mode::NotificationFuture;
 use codex_code_mode::ToolInvocationFuture;
+use codex_protocol::ResponseItemId;
+use codex_protocol::ThreadId;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use super::ExecContext;
 use super::PUBLIC_TOOL_NAME;
-use super::call_nested_tool;
+use super::submit_nested_tool;
+use super::telemetry::DispatchInterruption;
+use super::telemetry::NestedToolDispatchTrace;
+use super::telemetry::trace_id;
 use crate::session::step_context::StepContext;
+use crate::tools::ExecutedToolCalls;
+use crate::tools::call_trace;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::parallel::ToolCallRuntime;
 
 pub(super) struct CodeModeDispatchBroker {
+    thread_id: ThreadId,
     dispatch_tx: async_channel::Sender<DispatchMessage>,
     dispatch_rx: async_channel::Receiver<DispatchMessage>,
-    dispatch_gates: Arc<Mutex<HashMap<CellId, watch::Sender<bool>>>>,
+    dispatch_gates: Arc<Mutex<HashMap<CellId, CellDispatchGate>>>,
+    executed_tool_calls: ExecutedToolCalls,
+}
+
+struct CellDispatchGate {
+    ready: watch::Sender<bool>,
+    // Keep the original exec item when later waits resume this cell.
+    originating_item_id: Option<ResponseItemId>,
 }
 
 impl CodeModeDispatchBroker {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(thread_id: ThreadId, executed_tool_calls: ExecutedToolCalls) -> Self {
         let (dispatch_tx, dispatch_rx) = async_channel::unbounded();
         Self {
+            thread_id,
             dispatch_tx,
             dispatch_rx,
             dispatch_gates: Arc::new(Mutex::new(HashMap::new())),
+            executed_tool_calls,
         }
     }
 
-    pub(super) fn mark_cell_ready_for_dispatch(&self, cell_id: &CellId) {
-        dispatch_gate(&self.dispatch_gates, cell_id).send_replace(true);
+    pub(super) fn mark_cell_ready_for_dispatch(
+        &self,
+        cell_id: &CellId,
+        originating_item_id: Option<ResponseItemId>,
+    ) {
+        let ready = {
+            let mut dispatch_gates = self
+                .dispatch_gates
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let gate = dispatch_gates
+                .entry(cell_id.clone())
+                .or_insert_with(|| CellDispatchGate {
+                    ready: watch::channel(false).0,
+                    originating_item_id: None,
+                });
+            gate.originating_item_id = originating_item_id;
+            gate.ready.clone()
+        };
+        ready.send_replace(true);
+    }
+
+    pub(super) fn cell_originating_item_id(&self, cell_id: &CellId) -> Option<ResponseItemId> {
+        self.dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(cell_id)
+            .and_then(|gate| gate.originating_item_id.clone())
     }
 
     pub(super) fn close_cell(&self, cell_id: &CellId) {
-        remove_dispatch_gate(&self.dispatch_gates, cell_id);
+        let mut dispatch_gates = self
+            .dispatch_gates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        dispatch_gates.remove(cell_id);
+        self.executed_tool_calls.finish_cell_recording(cell_id);
     }
 
     pub(super) fn active_cell_ids(&self) -> Vec<CellId> {
@@ -60,6 +109,7 @@ impl CodeModeDispatchBroker {
         step_context: Arc<StepContext>,
         tracker: SharedTurnDiffTracker,
     ) -> CodeModeDispatchWorker {
+        let track_completeness = ExecutedToolCalls::is_enabled(&exec.turn.config.features);
         let tool_runtime = ToolCallRuntime::new(Arc::clone(&exec.session), step_context, tracker);
         let host = Arc::new(CoreTurnHost { exec, tool_runtime });
         let dispatch_rx = self.dispatch_rx.clone();
@@ -98,6 +148,7 @@ impl CodeModeDispatchBroker {
                     }
                     DispatchMessage::InvokeTool {
                         invocation,
+                        mut dispatch_trace,
                         cancellation_token,
                         response_tx,
                     } => {
@@ -109,13 +160,48 @@ impl CodeModeDispatchBroker {
                         )
                         .await
                         {
+                            let outcome = if cancellation_token.is_cancelled() {
+                                DispatchInterruption::Cancelled
+                            } else {
+                                DispatchInterruption::CellClosed
+                            };
+                            dispatch_trace.interruption = Some(outcome);
                             remove_dispatch_gate(&dispatch_gates, &cell_id);
                             continue;
                         }
                         let host = Arc::clone(&host);
+                        let dispatch_gates = Arc::clone(&dispatch_gates);
+                        let span = dispatch_trace.span.clone();
                         tokio::spawn(async move {
-                            let invocation =
-                                host.invoke_tool(invocation, cancellation_token.clone());
+                            let invocation = {
+                                let dispatch_gate = track_completeness.then(|| {
+                                    dispatch_gates
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                });
+                                if dispatch_gate.as_ref().is_some_and(|gates| {
+                                    cancellation_token.is_cancelled()
+                                        || !gates.contains_key(&cell_id)
+                                }) {
+                                    let outcome = if cancellation_token.is_cancelled() {
+                                        DispatchInterruption::Cancelled
+                                    } else {
+                                        DispatchInterruption::CellClosed
+                                    };
+                                    dispatch_trace.interruption = Some(outcome);
+                                    return;
+                                }
+                                // Submission and cell closure share this gate.
+                                span.in_scope(|| {
+                                    dispatch_trace.interruption = None;
+                                    host.submit_tool(
+                                        invocation,
+                                        dispatch_trace.call_id.clone(),
+                                        cancellation_token.clone(),
+                                    )
+                                })
+                                .instrument(span)
+                            };
                             tokio::pin!(invocation);
                             let response = tokio::select! {
                                 biased;
@@ -135,7 +221,7 @@ impl CodeModeDispatchBroker {
 }
 
 fn dispatch_gate(
-    dispatch_gates: &Mutex<HashMap<CellId, watch::Sender<bool>>>,
+    dispatch_gates: &Mutex<HashMap<CellId, CellDispatchGate>>,
     cell_id: &CellId,
 ) -> watch::Sender<bool> {
     let mut dispatch_gates = match dispatch_gates.lock() {
@@ -144,12 +230,16 @@ fn dispatch_gate(
     };
     dispatch_gates
         .entry(cell_id.clone())
-        .or_insert_with(|| watch::channel(false).0)
+        .or_insert_with(|| CellDispatchGate {
+            ready: watch::channel(false).0,
+            originating_item_id: None,
+        })
+        .ready
         .clone()
 }
 
 fn remove_dispatch_gate(
-    dispatch_gates: &Mutex<HashMap<CellId, watch::Sender<bool>>>,
+    dispatch_gates: &Mutex<HashMap<CellId, CellDispatchGate>>,
     cell_id: &CellId,
 ) {
     let mut dispatch_gates = match dispatch_gates.lock() {
@@ -160,7 +250,7 @@ fn remove_dispatch_gate(
 }
 
 async fn wait_until_cell_ready_for_dispatch(
-    dispatch_gates: &Mutex<HashMap<CellId, watch::Sender<bool>>>,
+    dispatch_gates: &Mutex<HashMap<CellId, CellDispatchGate>>,
     cell_id: &CellId,
     cancellation_token: &CancellationToken,
 ) -> bool {
@@ -184,19 +274,46 @@ async fn wait_until_cell_ready_for_dispatch(
 }
 
 impl CodeModeSessionDelegate for CodeModeDispatchBroker {
+    #[tracing::instrument(
+        name = "code_mode.broker.invoke_tool",
+        level = "info",
+        skip_all,
+        fields(
+            conversation.id = %self.thread_id,
+            cell.id = %invocation.cell_id,
+            runtime_tool_call_id = invocation.runtime_tool_call_id.as_str(),
+            tool_name = invocation.tool_name.name.as_str(),
+            tool_namespace = invocation.tool_name.namespace.as_deref(),
+        )
+    )]
     fn invoke_tool<'a>(
         &'a self,
         invocation: CodeModeNestedToolCall,
         cancellation_token: CancellationToken,
     ) -> ToolInvocationFuture<'a> {
         Box::pin(async move {
+            let call_id = format!("{PUBLIC_TOOL_NAME}-{}", uuid::Uuid::new_v4());
+            call_trace::received(
+                self.thread_id,
+                &invocation.tool_name,
+                &call_id,
+                call_trace::Receipt::CodeModeBroker {
+                    cell_id: trace_id(invocation.cell_id.as_str()),
+                    runtime_tool_call_id: trace_id(&invocation.runtime_tool_call_id),
+                },
+            );
+            let mut dispatch_trace =
+                Box::new(NestedToolDispatchTrace::new(self.thread_id, call_id));
             if cancellation_token.is_cancelled() {
+                dispatch_trace.interruption = Some(DispatchInterruption::Cancelled);
                 return Err("code mode nested tool call cancelled".to_string());
             }
             let (response_tx, response_rx) = oneshot::channel();
+            // Only the worker can tell whether dispatch beats cancellation once the call is queued.
             self.dispatch_tx
                 .send(DispatchMessage::InvokeTool {
                     invocation,
+                    dispatch_trace,
                     cancellation_token: cancellation_token.clone(),
                     response_tx,
                 })
@@ -252,6 +369,7 @@ impl CodeModeSessionDelegate for CodeModeDispatchBroker {
 enum DispatchMessage {
     InvokeTool {
         invocation: CodeModeNestedToolCall,
+        dispatch_trace: Box<NestedToolDispatchTrace>,
         cancellation_token: CancellationToken,
         response_tx: oneshot::Sender<Result<JsonValue, String>>,
     },
@@ -282,19 +400,21 @@ struct CoreTurnHost {
 }
 
 impl CoreTurnHost {
-    async fn invoke_tool(
+    fn submit_tool(
         &self,
         invocation: CodeModeNestedToolCall,
+        call_id: String,
         cancellation_token: CancellationToken,
-    ) -> Result<JsonValue, String> {
-        call_nested_tool(
+    ) -> impl std::future::Future<Output = Result<JsonValue, String>> + Send + 'static {
+        let invocation = submit_nested_tool(
             self.exec.clone(),
             self.tool_runtime.clone(),
             invocation,
+            call_id,
             cancellation_token,
         )
-        .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string());
+        async move { invocation?.await.map_err(|error| error.to_string()) }
     }
 
     async fn notify(&self, call_id: String, cell_id: CellId, text: String) -> Result<(), String> {
@@ -316,3 +436,7 @@ impl CoreTurnHost {
             })
     }
 }
+
+#[cfg(test)]
+#[path = "delegate_tests.rs"]
+mod tests;

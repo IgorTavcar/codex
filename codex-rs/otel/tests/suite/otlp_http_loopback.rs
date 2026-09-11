@@ -1,3 +1,4 @@
+use codex_otel::EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::OtelExporter;
@@ -187,6 +188,12 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
 
     metrics.counter("codex.turns", /*inc*/ 1, &[("source", "test")])?;
     metrics.counter("codex.api_request", /*inc*/ 1, &[("status", "200")])?;
+    metrics.counter_with_description(
+        EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC,
+        "Client-side exec-server RPC attempts.",
+        /*inc*/ 1,
+        &[("method", "fs/readFile")],
+    )?;
     metrics.record_duration(
         "codex.api_request.duration_ms",
         Duration::from_millis(100),
@@ -258,6 +265,10 @@ fn otlp_http_exporter_sends_metrics_to_collector() -> Result<()> {
         body.contains("\"codex.api_request\""),
         "expected API-request counter not found; body prefix: {}",
         &body.chars().take(2000).collect::<String>()
+    );
+    assert!(
+        body.contains(EXEC_SERVER_CLIENT_REQUEST_COUNT_METRIC),
+        "custom OTLP must retain the exec-server client counter excluded from built-in Statsig"
     );
     assert!(
         body.contains("\"codex.api_request.duration_ms\""),
@@ -343,7 +354,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
         let _ = tx.send(captured);
     });
 
-    let otel = OtelProvider::from(&OtelSettings {
+    let otel = OtelProvider::try_new(&OtelSettings {
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -402,7 +413,7 @@ fn otlp_http_exporter_sends_logs_to_collector()
 
 #[test]
 fn otel_provider_rejects_header_unsafe_configured_tracestate() {
-    let result = OtelProvider::from(&OtelSettings {
+    let result = OtelProvider::try_new(&OtelSettings {
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -467,7 +478,7 @@ fn otlp_http_exporter_sends_traces_to_collector()
         let _ = tx.send(captured);
     });
 
-    let otel = OtelProvider::from(&OtelSettings {
+    let otel = OtelProvider::try_new(&OtelSettings {
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -612,7 +623,7 @@ async fn otlp_http_exporter_sends_traces_to_collector_with_bounded_shutdown_in_t
         let _ = tx.send(captured);
     });
 
-    let otel = OtelProvider::from(&OtelSettings {
+    let otel = OtelProvider::try_new(&OtelSettings {
         environment: "test".to_string(),
         service_name: "codex-cli".to_string(),
         service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -705,7 +716,7 @@ fn otlp_http_exporter_times_out_when_collector_stalls_during_bounded_shutdown() 
         .build()
         .expect("build tokio runtime");
     let (result, elapsed) = runtime.block_on(async move {
-        let otel = OtelProvider::from(&OtelSettings {
+        let otel = OtelProvider::try_new(&OtelSettings {
             environment: "test".to_string(),
             service_name: "codex-cli".to_string(),
             service_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -804,7 +815,7 @@ fn otlp_http_exporter_sends_traces_to_collector_in_current_thread_tokio_runtime(
             .expect("current-thread runtime");
 
         let result = runtime.block_on(async move {
-            let otel = OtelProvider::from(&OtelSettings {
+            let otel = OtelProvider::try_new(&OtelSettings {
                 environment: "test".to_string(),
                 service_name: "codex-cli".to_string(),
                 service_version: env!("CARGO_PKG_VERSION").to_string(),

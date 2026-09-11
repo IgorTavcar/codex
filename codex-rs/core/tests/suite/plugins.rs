@@ -5,8 +5,11 @@ use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::Result;
+use codex_config::LoaderOverrides;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::set_project_trust_level;
 use codex_core_plugins::store::PluginStore;
 use codex_extension_api::ExtensionRegistry;
 use codex_extension_api::ExtensionRegistryBuilder;
@@ -20,15 +23,18 @@ use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::Settings;
+use codex_protocol::config_types::TrustLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ThreadSettingsOverrides;
 use codex_protocol::user_input::UserInput;
+use codex_skills_extension::HostSkillsLoadInput;
 use codex_skills_extension::SkillsExtensionConfig;
 use codex_skills_extension::install;
 use core_test_support::apps_test_server::AppsTestServer;
 use core_test_support::apps_test_server::SEARCH_CALENDAR_CREATE_TOOL;
+use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::responses::ResponseMock;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
@@ -46,6 +52,7 @@ use core_test_support::skip_if_no_network;
 use core_test_support::skip_if_remote;
 use core_test_support::skip_if_target_windows;
 use core_test_support::stdio_server_bin;
+use core_test_support::submit_thread_settings;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
@@ -58,7 +65,11 @@ use core_test_support::zsh_fork::zsh_fork_test_builder;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use test_case::test_case;
+use wiremock::Mock;
 use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 const SAMPLE_PLUGIN_CONFIG_NAME: &str = "sample@test";
 const SAMPLE_REMOTE_PLUGIN_CONFIG_NAME: &str = "sample@openai-curated-remote";
@@ -75,6 +86,7 @@ fn skills_extensions() -> Arc<ExtensionRegistry<Config>> {
     let mut extensions = ExtensionRegistryBuilder::<Config>::new();
     install(&mut extensions, |config: &Config| SkillsExtensionConfig {
         include_instructions: config.include_skill_instructions,
+        max_context_tokens: config.skill_max_context_tokens,
         bundled_skills_enabled: config.bundled_skills_enabled(),
         orchestrator_skills_enabled: config.orchestrator_skills_enabled,
         shadow_selection_enabled: config.features.enabled(Feature::SkillSearch),
@@ -86,7 +98,7 @@ fn sample_plugin_root(home: &TempDir) -> std::path::PathBuf {
     home.path().join("plugins/cache/test/sample/local")
 }
 
-fn write_sample_plugin_manifest_and_config(home: &TempDir) -> std::path::PathBuf {
+pub(super) fn write_sample_plugin_manifest_and_config(home: &TempDir) -> std::path::PathBuf {
     write_sample_plugin_manifest_and_config_at_root(
         home,
         sample_plugin_root(home),
@@ -386,7 +398,7 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
     let command = shlex::try_join(["/bin/sh", script_path.to_string_lossy().as_ref()])?;
     let call_id = "remote-plugin-command";
     let arguments = serde_json::to_string(&serde_json::json!({
-        "command": command,
+        "cmd": command,
         "login": false,
     }))?;
     mount_sse_sequence(
@@ -394,7 +406,7 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_function_call(call_id, "shell_command", &arguments),
+                ev_function_call(call_id, "exec_command", &arguments),
                 ev_completed("resp-1"),
             ]),
             sse(vec![
@@ -483,6 +495,152 @@ async fn persisted_remote_plugin_command_attribution_flows_through_turn_context(
         })
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn thread_disabled_plugins_filter_skills_and_tools_without_changing_shared_plugins()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let apps = AppsTestServer::mount_with_connector_name(&server, "Google Calendar").await?;
+    let home = Arc::new(TempDir::new()?);
+    let skill_path = dunce::canonicalize(write_plugin_skill_plugin(home.as_ref()))?;
+    std::fs::write(
+        &skill_path,
+        "---\ndescription: inspect sample data\n---\nTHREAD_PLUGIN_SKILL_BODY\n",
+    )?;
+    write_plugin_mcp_plugin(home.as_ref(), &stdio_server_bin()?);
+    write_plugin_app_plugin_with_name(home.as_ref(), "sample_app");
+    let mut builder = test_codex()
+        .with_home(home)
+        .with_extensions(skills_extensions())
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| {
+            config.features.enable(Feature::Apps).unwrap();
+            config.chatgpt_base_url = apps.chatgpt_base_url;
+        });
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    let manager = test.thread_manager.plugins_manager();
+    let plugins_input = test.config.plugins_config_input();
+    let shared_plugins = manager.plugins_for_config(&plugins_input).await;
+    let tool_calls = [
+        (
+            "sample",
+            "echo",
+            Some(serde_json::json!({"message": "plugin check"})),
+        ),
+        (CODEX_APPS_MCP_SERVER_NAME, "calendar_list_events", None),
+    ];
+
+    for (phase, enabled, injection_count) in [(0, true, 1), (1, false, 1), (2, true, 2)] {
+        if !enabled {
+            submit_thread_settings(
+                &test.codex,
+                ThreadSettingsOverrides {
+                    disabled_plugin_ids: Some(vec![SAMPLE_PLUGIN_CONFIG_NAME.to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            // Saving pending settings must not change the admitted runtime.
+            for (server_name, tool, arguments) in &tool_calls {
+                test.codex
+                    .call_mcp_tool(server_name, tool, arguments.clone(), /*meta*/ None)
+                    .await?;
+            }
+        }
+        let app_call_id = format!("plugin-app-{phase}");
+        let mcp_call_id = format!("plugin-mcp-{phase}");
+        let mock = mount_sse_sequence(
+            &server,
+            vec![
+                sse(vec![
+                    ev_response_created("search"),
+                    ev_tool_search_call(
+                        &app_call_id,
+                        &serde_json::json!({"query": "create calendar event"}),
+                    ),
+                    ev_tool_search_call(&mcp_call_id, &serde_json::json!({"query": "echo"})),
+                    ev_completed("search"),
+                ]),
+                sse(vec![ev_response_created("done"), ev_completed("done")]),
+            ],
+        )
+        .await;
+        test.codex
+            .start_or_steer_turn(
+                TurnInputRequest::user_input(vec![
+                    UserInput::Skill {
+                        name: "sample:sample-search".into(),
+                        path: skill_path.clone(),
+                    },
+                    UserInput::Mention {
+                        name: "sample".into(),
+                        path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
+                    },
+                ])
+                .with_thread_settings(ThreadSettingsOverrides {
+                    disabled_plugin_ids: enabled.then(Vec::new),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        let requests = mock.requests();
+        // Previously injected instructions remain in history; disabled turns must add none.
+        for (role, marker) in [
+            ("user", "THREAD_PLUGIN_SKILL_BODY"),
+            ("developer", "Skills from this plugin"),
+        ] {
+            assert_eq!(
+                requests[0]
+                    .message_input_texts(role)
+                    .iter()
+                    .filter(|text| text.contains(marker))
+                    .count(),
+                injection_count
+            );
+        }
+        for (call_id, namespace, tool) in [
+            (
+                &app_call_id,
+                SAMPLE_PLUGIN_APP_NAMESPACE,
+                SEARCH_CALENDAR_CREATE_TOOL,
+            ),
+            (&mcp_call_id, SAMPLE_PLUGIN_MCP_NAMESPACE, "echo"),
+        ] {
+            assert_eq!(
+                namespace_child_tool(&requests[1].tool_search_output(call_id), namespace, tool)
+                    .is_some(),
+                enabled
+            );
+        }
+        let calls_before = recorded_apps_tool_calls(&server).await.len();
+        // Direct Apps RPC calls keep their existing behavior outside model tool filtering.
+        for (server_name, tool, arguments) in &tool_calls {
+            let result = test
+                .codex
+                .call_mcp_tool(server_name, tool, arguments.clone(), /*meta*/ None)
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                enabled || *server_name == CODEX_APPS_MCP_SERVER_NAME,
+                "unexpected {server_name}/{tool} result: {result:?}"
+            );
+        }
+        assert_eq!(
+            recorded_apps_tool_calls(&server).await.len() - calls_before,
+            1
+        );
+        assert_eq!(
+            manager.plugins_for_config(&plugins_input).await,
+            shared_plugins
+        );
+    }
     Ok(())
 }
 
@@ -623,10 +781,8 @@ async fn plugin_skill_product_policy_and_migrated_command_precedence_reach_agent
     })
     .await;
 
-    let developer_text = response
-        .single_request()
-        .message_input_texts("developer")
-        .join("\n");
+    let requests = response.requests();
+    let developer_text = requests[0].message_input_texts("developer").join("\n");
     assert_eq!(
         (
             developer_text.contains("sample:source-command-review: native review skill"),
@@ -683,11 +839,114 @@ async fn legacy_plugin_skill_prompt_remains_complete() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() -> Result<()> {
+async fn sites_migration_agent_turn_prefers_loadable_remote_sites() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let response = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp1"), ev_completed("resp1")]),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/ps/plugins/installed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "plugins": [{
+                "id": "plugins~plugin_connector_1p_689987207de08191979cf68eca2941c6",
+                "name": "sites",
+                "scope": "GLOBAL",
+                "status": "ENABLED",
+                "installation_policy": "AVAILABLE",
+                "authentication_policy": "ON_USE",
+                "release": {
+                    "version": "local",
+                    "display_name": "Sites",
+                    "description": "Sites",
+                    "interface": {},
+                },
+                "enabled": true,
+            }],
+            "pagination": {"next_page_token": null},
+        })))
+        .mount(&server)
+        .await;
+
+    let codex_home = Arc::new(TempDir::new()?);
+    std::fs::write(
+        codex_home.path().join("config.toml"),
+        r#"[features]
+plugins = true
+remote_plugin = true
+
+[plugins."sites@openai-bundled"]
+enabled = true
+"#,
+    )?;
+    for (marketplace, skill) in [
+        ("openai-bundled", "bundled-sites"),
+        ("openai-curated-remote", "remote-sites"),
+    ] {
+        let root = codex_home
+            .path()
+            .join(format!("plugins/cache/{marketplace}/sites/local"));
+        std::fs::create_dir_all(root.join(".codex-plugin"))?;
+        std::fs::write(
+            root.join(".codex-plugin/plugin.json"),
+            r#"{"name":"sites"}"#,
+        )?;
+        let skill_dir = root.join("skills").join(skill);
+        std::fs::create_dir_all(&skill_dir)?;
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: {skill}\ndescription: test skill\n---\n\n# body\n"),
+        )?;
+    }
+
+    let chatgpt_base_url = server.uri();
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_extensions(skills_extensions())
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(move |config| config.chatgpt_base_url = chatgpt_base_url);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    let auth = test.thread_manager.auth_manager().auth().await;
+    test.thread_manager
+        .plugins_manager()
+        .reconcile_remote_installed_plugins(&test.config.plugins_config_input(), auth.as_ref())
+        .await?;
+
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "Inspect the available Sites skills.".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let requests = response.requests();
+    let developer_text = requests[0].message_input_texts("developer").join("\n");
+    assert_eq!(
+        (
+            developer_text.contains("sites:remote-sites"),
+            developer_text.contains("sites:bundled-sites"),
+        ),
+        (true, false),
+        "unexpected Sites skills in developer prompt: {developer_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths_and_codex_env_overlay()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let search_call_id = "search-agent-echo";
     let tool_call_id = "call-agent-echo";
+    let overlay_call_id = "call-agent-overlay-env";
     let mock = mount_sse_sequence(
         &server,
         vec![
@@ -708,8 +967,18 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
             ]),
             sse(vec![
                 ev_response_created("resp-3"),
-                ev_assistant_message("msg-1", "done"),
+                ev_function_call_with_namespace(
+                    overlay_call_id,
+                    "mcp__agent",
+                    "echo",
+                    r#"{"message":"ping","env_var":"INSTA_WORKSPACE_ROOT"}"#,
+                ),
                 ev_completed("resp-3"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-4"),
+                ev_assistant_message("msg-1", "done"),
+                ev_completed("resp-4"),
             ]),
         ],
     )
@@ -742,6 +1011,11 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
         plugin_root.join("mcp.json"),
         serde_json::to_vec_pretty(&mcp_config)?,
     )?;
+    std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+    std::fs::write(
+        plugin_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"acme.tools","mcpServers":{"agent":{"command":"ignored","env_vars":["INSTA_WORKSPACE_ROOT"]}}}"#,
+    )?;
     let mut builder = test_codex().with_home(Arc::clone(&codex_home));
     let test_codex = builder.build_with_remote_and_local_env(&server).await?;
     wait_for_mcp_server(&test_codex.codex, "agent").await?;
@@ -768,6 +1042,10 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
         matches!(event, EventMsg::McpToolCallEnd(_))
     })
     .await;
+    let overlay_end = wait_for_event(&test_codex.codex, |event| {
+        matches!(event, EventMsg::McpToolCallEnd(_))
+    })
+    .await;
     wait_for_event(&test_codex.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
@@ -785,15 +1063,35 @@ async fn agent_plugin_root_mcp_stdio_tool_round_trip_expands_reserved_paths() ->
             .and_then(serde_json::Value::as_str),
         Some(expected_env.as_str())
     );
+    let EventMsg::McpToolCallEnd(overlay_end) = overlay_end else {
+        unreachable!("wait_for_event matched an MCP tool end")
+    };
+    let overlay_result = overlay_end
+        .result
+        .as_ref()
+        .expect("Agent Plugin overlay MCP tool result");
+    assert_eq!(
+        overlay_result
+            .structured_content
+            .as_ref()
+            .and_then(|content| content.get("env"))
+            .and_then(serde_json::Value::as_str),
+        Some(std::env::var("INSTA_WORKSPACE_ROOT")?.as_str())
+    );
     let requests = mock.requests();
     let search_output = requests[1].tool_search_output(search_call_id);
     assert!(namespace_child_tool(&search_output, "mcp__agent", "echo").is_some());
     assert!(requests[2].function_call_output(tool_call_id).is_object());
+    assert!(
+        requests[3]
+            .function_call_output(overlay_call_id)
+            .is_object()
+    );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<()> {
+async fn curated_plugin_skills_follow_auth_switch() -> Result<()> {
     const CHATGPT_CURATED_PLUGIN_SKILL: &str = "chatgpt-plugin:chatgpt-skill";
     const API_CURATED_PLUGIN_SKILL: &str = "api-plugin:api-skill";
     const CURATED_PLUGIN_SKILLS: &[&str] =
@@ -812,7 +1110,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
         name: &'static str,
         target_auth: TargetAuth,
         target_model_provider_id: &'static str,
-        target_prompt: &'static str,
         expected_target_loaded_plugin_skills: &'static [&'static str],
         expected_target_skill_description: &'static str,
     }
@@ -822,7 +1119,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
             name: "ChatGPT",
             target_auth: TargetAuth::Chatgpt,
             target_model_provider_id: OPENAI_PROVIDER_ID,
-            target_prompt: "chatgpt target turn",
             expected_target_loaded_plugin_skills: &[CHATGPT_CURATED_PLUGIN_SKILL],
             expected_target_skill_description: "chatgpt description",
         },
@@ -830,7 +1126,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
             name: "ChatGPT with a custom provider",
             target_auth: TargetAuth::Chatgpt,
             target_model_provider_id: "ollama",
-            target_prompt: "chatgpt custom provider target turn",
             expected_target_loaded_plugin_skills: &[CHATGPT_CURATED_PLUGIN_SKILL],
             expected_target_skill_description: "chatgpt description",
         },
@@ -838,7 +1133,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
             name: "API key",
             target_auth: TargetAuth::ApiKey,
             target_model_provider_id: OPENAI_PROVIDER_ID,
-            target_prompt: "api key target turn",
             expected_target_loaded_plugin_skills: &[API_CURATED_PLUGIN_SKILL],
             expected_target_skill_description: "api description before",
         },
@@ -846,7 +1140,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
             name: "Bedrock API key",
             target_auth: TargetAuth::BedrockApiKey,
             target_model_provider_id: AMAZON_BEDROCK_PROVIDER_ID,
-            target_prompt: "bedrock key target turn",
             expected_target_loaded_plugin_skills: &[API_CURATED_PLUGIN_SKILL],
             expected_target_skill_description: "api description before",
         },
@@ -854,7 +1147,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
             name: "ambient Bedrock",
             target_auth: TargetAuth::NoCodexAuth,
             target_model_provider_id: AMAZON_BEDROCK_PROVIDER_ID,
-            target_prompt: "ambient bedrock target turn",
             expected_target_loaded_plugin_skills: &[API_CURATED_PLUGIN_SKILL],
             expected_target_skill_description: "api description before",
         },
@@ -862,7 +1154,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
             name: "unauthenticated OpenAI",
             target_auth: TargetAuth::NoCodexAuth,
             target_model_provider_id: OPENAI_PROVIDER_ID,
-            target_prompt: "unauthenticated openai target turn",
             expected_target_loaded_plugin_skills: &[API_CURATED_PLUGIN_SKILL],
             expected_target_skill_description: "api description before",
         },
@@ -870,47 +1161,44 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
             name: "unauthenticated custom provider",
             target_auth: TargetAuth::NoCodexAuth,
             target_model_provider_id: "ollama",
-            target_prompt: "unauthenticated custom provider target turn",
             expected_target_loaded_plugin_skills: &[API_CURATED_PLUGIN_SKILL],
             expected_target_skill_description: "api description before",
         },
     ];
 
-    async fn skills_for_agent_turn(
-        test_codex: &TestCodex,
-        response: &ResponseMock,
-        model_provider_id: &str,
-        prompt: &str,
-        expected_request_count: usize,
-    ) -> Result<String> {
-        let mut config = test_codex.config.clone();
-        config.model_provider_id = model_provider_id.to_string();
-        let thread = test_codex
+    async fn loaded_plugin_skills_for_config(test_codex: &TestCodex, config: &Config) -> String {
+        let plugins_input = config.plugins_config_input();
+        let plugins_manager = test_codex.thread_manager.plugins_manager();
+        let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
+        let skills_input = HostSkillsLoadInput::new(
+            config.cwd.clone(),
+            plugin_outcome.effective_plugin_skill_roots(),
+            config.config_layer_stack.clone(),
+        )
+        .with_plugin_skill_snapshots(
+            plugins_manager.plugin_skill_snapshots_for_config(&plugins_input),
+        );
+        let skills_snapshot = test_codex
             .thread_manager
-            .start_thread(codex_core::StartThreadOptions::new(config))
-            .await?
-            .thread;
-        thread
-            .start_or_steer_turn(TurnInputRequest::user_input(vec![
-                codex_protocol::user_input::UserInput::Text {
-                    text: prompt.to_string(),
-                    text_elements: Vec::new(),
-                },
-            ]))
-            .await?;
-        wait_for_event(&thread, |event| matches!(event, EventMsg::TurnComplete(_))).await;
-
-        let requests = response.requests();
-        assert_eq!(requests.len(), expected_request_count);
-        Ok(requests
-            .last()
-            .expect("agent turn should send a request")
-            .message_input_text_groups("developer")
-            .into_iter()
-            .rev()
-            .find(|texts| texts.iter().any(|text| text.contains("## Skills")))
-            .expect("agent turn should include a skills developer message")
-            .join("\n"))
+            .skills_service()
+            .snapshot_for_config(&skills_input, /*fs*/ None)
+            .await;
+        skills_snapshot
+            .outcome()
+            .skills
+            .iter()
+            .filter_map(|skill| {
+                let plugin_id = skill.plugin_id.as_deref()?;
+                let plugin_name = plugin_id
+                    .split_once('@')
+                    .map_or(plugin_id, |(plugin_name, _)| plugin_name);
+                Some(format!(
+                    "{plugin_name}:{}\n{}",
+                    skill.name, skill.description
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     skip_if_no_network!(Ok(()));
@@ -930,20 +1218,6 @@ async fn agent_turns_route_curated_plugin_skills_after_auth_switch() -> Result<(
 
     for fixture in FIXTURES {
         let server = start_mock_server().await;
-        let response = mount_sse_sequence(
-            &server,
-            vec![
-                sse(vec![
-                    ev_response_created("resp-initial"),
-                    ev_completed("resp-initial"),
-                ]),
-                sse(vec![
-                    ev_response_created("resp-target"),
-                    ev_completed("resp-target"),
-                ]),
-            ],
-        )
-        .await;
 
         let codex_home = Arc::new(TempDir::new()?);
         std::fs::write(
@@ -997,20 +1271,10 @@ enabled = true
             .with_extensions(skills_extensions())
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing());
         let test_codex = builder.build_with_auto_env(&server).await?;
-        let plugins_manager = test_codex.thread_manager.plugins_manager();
-        let skills_service = test_codex.thread_manager.skills_service();
-
-        let initial_skills = skills_for_agent_turn(
-            &test_codex,
-            &response,
-            OPENAI_PROVIDER_ID,
-            "initial chatgpt turn",
-            /*expected_request_count*/ 1,
-        )
-        .await?;
+        let initial_skills = loaded_plugin_skills_for_config(&test_codex, &test_codex.config).await;
         assert_loaded_plugin_skills(
             fixture.name,
-            "initial ChatGPT turn",
+            "initial ChatGPT config",
             &initial_skills,
             &[CHATGPT_CURATED_PLUGIN_SKILL],
         );
@@ -1023,35 +1287,45 @@ enabled = true
             "---\ndescription: api description after\n---\n\n# body\n",
         )?;
 
-        match fixture.target_auth {
-            TargetAuth::Chatgpt => {}
+        let expected_auth_mode = match fixture.target_auth {
+            TargetAuth::Chatgpt => Some(AuthMode::Chatgpt),
             TargetAuth::ApiKey => {
-                plugins_manager.set_auth_mode(Some(AuthMode::ApiKey));
+                codex_login::login_with_api_key(
+                    codex_home.path(),
+                    "test-api-key",
+                    codex_login::AuthCredentialsStoreMode::File,
+                    codex_login::AuthKeyringBackendKind::default(),
+                )?;
+                test_codex.thread_manager.auth_manager().reload().await;
+                Some(AuthMode::ApiKey)
             }
             TargetAuth::BedrockApiKey => {
-                plugins_manager.set_auth_mode(Some(AuthMode::BedrockApiKey));
+                codex_login::login_with_bedrock_api_key(
+                    codex_home.path(),
+                    "test-bedrock-api-key",
+                    "us-east-1",
+                    codex_login::AuthCredentialsStoreMode::File,
+                    codex_login::AuthKeyringBackendKind::default(),
+                )?;
+                test_codex.thread_manager.auth_manager().reload().await;
+                Some(AuthMode::BedrockApiKey)
             }
             TargetAuth::NoCodexAuth => {
                 test_codex.thread_manager.auth_manager().logout().await?;
-                assert_eq!(
-                    test_codex.thread_manager.auth_manager().get_api_auth_mode(),
-                    None
-                );
-                plugins_manager.set_auth_mode(/*auth_mode*/ None);
+                None
             }
-        }
-        skills_service.clear_cache();
-        let target_skills = skills_for_agent_turn(
-            &test_codex,
-            &response,
-            fixture.target_model_provider_id,
-            fixture.target_prompt,
-            /*expected_request_count*/ 2,
-        )
-        .await?;
+        };
+        assert_eq!(
+            test_codex.thread_manager.auth_manager().get_api_auth_mode(),
+            expected_auth_mode
+        );
+        test_codex.thread_manager.skills_service().clear_cache();
+        let mut target_config = test_codex.config.clone();
+        target_config.model_provider_id = fixture.target_model_provider_id.to_string();
+        let target_skills = loaded_plugin_skills_for_config(&test_codex, &target_config).await;
         assert_loaded_plugin_skills(
             fixture.name,
-            "target turn",
+            "target config",
             &target_skills,
             fixture.expected_target_loaded_plugin_skills,
         );
@@ -1222,6 +1496,121 @@ async fn explicit_plugin_mentions_keep_non_conflicting_mcp_for_chatgpt_auth() ->
     let echo_tool = echo_tool.expect("plugin MCP tool should remain searchable");
     assert_plugin_provenance(&echo_tool);
 
+    Ok(())
+}
+
+#[test_case(TrustLevel::Trusted, true, true, false, &[]; "trusted project disables the plugin")]
+#[test_case(TrustLevel::Untrusted, true, true, false, &["echo_tool"]; "untrusted project cannot disable the plugin")]
+#[test_case(TrustLevel::Trusted, false, true, true, &["echo"]; "trusted project enables system-disabled server and overrides user tool policy")]
+#[test_case(TrustLevel::Untrusted, false, true, true, &[]; "untrusted project cannot enable system-disabled server")]
+#[test_case(TrustLevel::Trusted, true, false, true, &[]; "trusted project disables system-enabled server")]
+#[test_case(TrustLevel::Untrusted, true, false, true, &["echo_tool"]; "untrusted project preserves system startup and user tool policy")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn system_marketplace_plugin_honors_layered_activation_and_mcp_policy(
+    trust_level: TrustLevel,
+    system_enabled: bool,
+    project_enabled: bool,
+    plugin_enabled: bool,
+    expected_tools: &[&str],
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let mock = mount_plugin_tool_search_turn(&server).await;
+    let codex_home = Arc::new(TempDir::new()?);
+    let project = TempDir::new()?;
+    write_plugin_mcp_plugin(codex_home.as_ref(), &stdio_server_bin()?);
+    let user_config_path = codex_home.path().join("config.toml");
+    let user_config = std::fs::read_to_string(&user_config_path)?;
+    std::fs::write(
+        &user_config_path,
+        format!(
+            "{user_config}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\ndisabled_tools = [\"echo\"]\n"
+        ),
+    )?;
+    let system_config_path = codex_home.path().join("system.toml");
+    let marketplace = TempDir::new()?;
+    std::fs::create_dir_all(marketplace.path().join(".agents/plugins"))?;
+    std::fs::write(
+        marketplace.path().join(".agents/plugins/marketplace.json"),
+        r#"{"name":"test","plugins":[{"name":"sample","source":{"source":"local","path":"./sample"}}]}"#,
+    )?;
+    let marketplace_source = toml::Value::String(marketplace.path().to_string_lossy().into_owned());
+    std::fs::write(
+        &system_config_path,
+        format!(
+            "[marketplaces.test]\nsource_type = \"local\"\nsource = {marketplace_source}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\nenabled = {system_enabled}\nenabled_tools = [\"echo\", \"echo-tool\"]\n"
+        ),
+    )?;
+    // The cached plugin may activate only through this system-defined marketplace.
+    // Without the definition, source restrictions exclude it from the real turn.
+    let requirements_path = codex_home.path().join("requirements.toml");
+    std::fs::write(
+        &requirements_path,
+        format!(
+            "[marketplaces]\nrestrict_to_allowed_sources = true\n[marketplaces.allowed_sources.test]\nsource = \"local\"\npath = {marketplace_source}\n"
+        ),
+    )?;
+    std::fs::create_dir_all(project.path().join(".git"))?;
+    std::fs::create_dir_all(project.path().join(".codex"))?;
+    std::fs::write(
+        project.path().join(".codex/config.toml"),
+        format!(
+            "[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\"]\nenabled = {plugin_enabled}\n[plugins.\"{SAMPLE_PLUGIN_CONFIG_NAME}\".mcp_servers.sample]\nenabled = {project_enabled}\ndisabled_tools = [\"echo-tool\"]\n"
+        ),
+    )?;
+    set_project_trust_level(codex_home.path(), project.path(), trust_level)?;
+    // Exercise the real layer loader and trust checks while keeping the test harness's
+    // mock model provider and automatically selected executor environment.
+    let layered_config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .fallback_cwd(Some(project.path().to_path_buf()))
+        .loader_overrides(LoaderOverrides {
+            system_config_path: Some(system_config_path),
+            system_requirements_path: Some(requirements_path),
+            ..LoaderOverrides::without_managed_config_for_tests()
+        })
+        .build()
+        .await?;
+    let mut builder = test_codex()
+        .with_home(codex_home)
+        .with_config(move |config| config.config_layer_stack = layered_config.config_layer_stack);
+    let test = builder.build_with_remote_and_local_env(&server).await?;
+    let startup = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::McpStartupComplete(summary) => Some(summary.clone()),
+        _ => None,
+    })
+    .await;
+    let expected_ready = if expected_tools.is_empty() {
+        vec![]
+    } else {
+        vec!["sample"]
+    };
+    assert_eq!(
+        serde_json::to_value(startup)?,
+        serde_json::json!({"ready": expected_ready, "failed": [], "cancelled": []}),
+    );
+    test.codex
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Mention {
+            name: "sample".into(),
+            path: format!("plugin://{SAMPLE_PLUGIN_CONFIG_NAME}"),
+        }]))
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+    let requests = mock.requests();
+    let output = requests[1].tool_search_output(PLUGIN_MCP_SEARCH_CALL_ID);
+    let mut visible_tools = output["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|namespace| namespace["name"] == SAMPLE_PLUGIN_MCP_NAMESPACE)
+        .flat_map(|namespace| namespace["tools"].as_array().into_iter().flatten())
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect::<Vec<_>>();
+    visible_tools.sort_unstable();
+    assert_eq!(visible_tools, expected_tools);
     Ok(())
 }
 
@@ -1472,7 +1861,7 @@ async fn implicit_plugin_skill_invocation_tracks_remote_plugin_id(
         }
     };
     let command_args = serde_json::json!({
-        "command": command,
+        "cmd": command,
         "login": false,
     })
     .to_string();
@@ -1481,7 +1870,7 @@ async fn implicit_plugin_skill_invocation_tracks_remote_plugin_id(
         vec![
             sse(vec![
                 ev_response_created("resp-1"),
-                ev_function_call("call-1", "shell_command", &command_args),
+                ev_function_call("call-1", "exec_command", &command_args),
                 ev_completed("resp-1"),
             ]),
             sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
